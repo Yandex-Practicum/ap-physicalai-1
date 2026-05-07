@@ -155,3 +155,4 @@ sleep 2
 print_connect_info
 echo "==> Подключаюсь..."
 exec docker exec -it -w "$WORKDIR" "$CONTAINER" bash
+

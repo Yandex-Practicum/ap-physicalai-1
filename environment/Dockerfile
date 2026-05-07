@@ -67,4 +67,5 @@ WORKDIR /workspace
 
 EXPOSE 5900 6080
 
+ENTRYPOINT []
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
