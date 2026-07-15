@@ -59,6 +59,10 @@ def parse_args() -> argparse.Namespace:
 # считаем, что робот его успешно схватил (оторвал от стола).
 GRASP_Z_THRESHOLD = 0.2
 
+# Порог по евклидову расстоянию между кубом и целью: если в конце эпизода
+# расстояние меньше порога, эпизод засчитывается как успешный (success rate).
+SUCCESS_THRESHOLD = 0.05
+
 
 def _maybe_add_obs_noise(obs_torch: torch.Tensor, obs_noise: float) -> torch.Tensor:
     if obs_noise > 0.0:
@@ -68,6 +72,25 @@ def _maybe_add_obs_noise(obs_torch: torch.Tensor, obs_noise: float) -> torch.Ten
 
 def _cube_z(state) -> float:
     return float(state.data.qpos[..., 11])
+
+
+def _box_pos(state) -> np.ndarray:
+    # Куб — freejoint после 9 DOF руки (7 arm + 2 gripper);
+    # qpos[9:12] — это его x, y, z.
+    qpos = state.data.qpos
+    return np.array([
+        float(qpos[..., 9]),
+        float(qpos[..., 10]),
+        float(qpos[..., 11]),
+    ])
+
+
+def _target_pos(state) -> np.ndarray:
+    return np.array(state.info["target_pos"]).flatten()
+
+
+def _pos_err(state) -> float:
+    return float(np.linalg.norm(_target_pos(state) - _box_pos(state)))
 
 
 def build_runner(checkpoint_path: str, device: str) -> OnPolicyRunner:
@@ -117,7 +140,8 @@ def _override_cube_pos(state, cube_x, cube_y):
 def rollout_single_episode(env, policy, rng, episode_length, is_dict_obs,
                            jit_reset, jit_step,
                            cube_x=None, cube_y=None, obs_noise=0.0):
-    """Прогоняет один эпизод и возвращает (trajectory, total_reward, grasped)."""
+    """Прогоняет один эпизод и возвращает
+    (trajectory, total_reward, grasped, success, final_pos_err)."""
     state = jit_reset(rng)
     if cube_x is not None or cube_y is not None:
         state = _override_cube_pos(state, cube_x, cube_y)
@@ -125,6 +149,7 @@ def rollout_single_episode(env, policy, rng, episode_length, is_dict_obs,
     trajectory = [state]
     total_reward = 0.0
     max_cube_z = _cube_z(state)
+    final_pos_err = _pos_err(state)
 
     for _ in range(episode_length):
         obs = state.obs["state"] if is_dict_obs else state.obs
@@ -139,12 +164,14 @@ def rollout_single_episode(env, policy, rng, episode_length, is_dict_obs,
         trajectory.append(state)
         total_reward += float(state.reward)
         max_cube_z = max(max_cube_z, _cube_z(state))
+        final_pos_err = _pos_err(state)
 
         if state.done:
             break
 
     grasped = max_cube_z > GRASP_Z_THRESHOLD
-    return trajectory, total_reward, grasped
+    success = final_pos_err < SUCCESS_THRESHOLD
+    return trajectory, total_reward, grasped, success, final_pos_err
 
 
 def run_interactive(env, policy, args, env_cfg, is_dict_obs):
@@ -162,6 +189,7 @@ def run_interactive(env, policy, args, env_cfg, is_dict_obs):
 
     mj_data = mujoco.MjData(mj_model)
     grasps = 0
+    successes = 0
     total_rewards = []
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         for ep in range(args.episodes):
@@ -171,6 +199,7 @@ def run_interactive(env, policy, args, env_cfg, is_dict_obs):
                 state = _override_cube_pos(state, args.cube_x, args.cube_y)
             total_reward = 0.0
             max_cube_z = _cube_z(state)
+            final_pos_err = _pos_err(state)
 
             obs = state.obs["state"] if is_dict_obs else state.obs
             obs_torch = wrapper_torch._jax_to_torch(obs)
@@ -190,6 +219,7 @@ def run_interactive(env, policy, args, env_cfg, is_dict_obs):
                 )
                 total_reward += float(state.reward)
                 max_cube_z = max(max_cube_z, _cube_z(state))
+                final_pos_err = _pos_err(state)
 
                 mj_data.qpos[:] = np.array(state.data.qpos).flatten()
                 mj_data.qvel[:] = np.array(state.data.qvel).flatten()
@@ -206,15 +236,21 @@ def run_interactive(env, policy, args, env_cfg, is_dict_obs):
                     break
 
             grasped = max_cube_z > GRASP_Z_THRESHOLD
+            success = final_pos_err < SUCCESS_THRESHOLD
             grasps += int(grasped)
+            successes += int(success)
             total_rewards.append(total_reward)
-            mark = "✔" if grasped else "✘"
+            grasp_mark = "✔" if grasped else "✘"
+            success_mark = "✔" if success else "✘"
             print(f"  Эпизод {ep + 1}/{args.episodes}: "
-                  f"reward = {total_reward:.2f}, захват: {mark}")
+                  f"reward = {total_reward:.2f}, захват: {grasp_mark}, "
+                  f"успех: {success_mark} (расстояние до цели = {final_pos_err:.3f} м, threshold = {SUCCESS_THRESHOLD:.2f} м)")
 
     if total_rewards:
-        mean_reward = sum(total_rewards) / len(total_rewards)
-        print(f"\nИтого: захватов {grasps}/{len(total_rewards)}, "
+        n = len(total_rewards)
+        mean_reward = sum(total_rewards) / n
+        print(f"\nИтого: захватов {grasps}/{n}, "
+              f"success rate = {successes}/{n}, "
               f"средняя награда {mean_reward:.2f}")
 
 
@@ -230,27 +266,33 @@ def run_record(env, policy, args, env_cfg, is_dict_obs, record_path: str):
     fps = 1.0 / env.dt / render_every
 
     grasps = 0
+    successes = 0
     total_rewards = []
     for ep in range(args.episodes):
         rng = jax.random.PRNGKey(args.seed + ep)
-        trajectory, total_reward, grasped = rollout_single_episode(
+        trajectory, total_reward, grasped, success, final_pos_err = rollout_single_episode(
             env, policy, rng, env_cfg.episode_length, is_dict_obs,
             jit_reset=jit_reset, jit_step=jit_step,
             cube_x=args.cube_x, cube_y=args.cube_y,
             obs_noise=args.obs_noise,
         )
         grasps += int(grasped)
+        successes += int(success)
         total_rewards.append(total_reward)
-        mark = "✔" if grasped else "✘"
+        grasp_mark = "✔" if grasped else "✘"
+        success_mark = "✔" if success else "✘"
         print(f"  Эпизод {ep + 1}/{args.episodes}: "
-              f"reward = {total_reward:.2f}, захват: {mark}")
+              f"reward = {total_reward:.2f}, захват: {grasp_mark}, "
+              f"успех: {success_mark} (расстояние до цели = {final_pos_err:.3f} м, threshold = {SUCCESS_THRESHOLD:.2f} м)")
 
         traj_subset = trajectory[::render_every]
         frames = env.render(traj_subset, height=480, width=640)
         all_frames.extend(frames)
 
-    mean_reward = sum(total_rewards) / len(total_rewards)
-    print(f"\nИтого: захватов {grasps}/{len(total_rewards)}, "
+    n = len(total_rewards)
+    mean_reward = sum(total_rewards) / n
+    print(f"\nИтого: захватов {grasps}/{n}, "
+          f"success rate = {successes}/{n}, "
           f"средняя награда {mean_reward:.2f}")
     print(f"\nСохранение видео: {record_path} ({len(all_frames)} кадров, {fps:.0f} fps)")
     os.makedirs(os.path.dirname(record_path) or ".", exist_ok=True)

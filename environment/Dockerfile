@@ -37,22 +37,23 @@ RUN apt-get update && apt-get install -y \
 
 # ── PyTorch (CUDA 12) ────────────────────────────────────────
 RUN pip3 install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cu124
+    torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # ── MuJoCo Playground + RSL-RL ───────────────────────────────
 RUN pip3 install --no-cache-dir \
-    "playground[learning]"
+    "playground[learning]==0.1.0"
 
-RUN pip3 install --no-cache-dir --upgrade "jax[cuda12]"
+RUN pip3 install --no-cache-dir --upgrade "jax[cuda12]==0.6.2"
 
 # ── Дополнительные зависимости ────────────────────────────────
 RUN pip3 install --no-cache-dir \
-    mujoco \
-    gymnasium[mujoco] \
-    numpy \
-    imageio[ffmpeg] \
-    pytest \
-    tensorboard
+    mujoco==3.5.0 \
+    mujoco-mjx==3.5.0 \
+    gymnasium[mujoco]==1.3.0 \
+    numpy==2.2.6 \
+    imageio[ffmpeg]==2.37.3 \
+    pytest==9.1.1 \
+    tensorboard==2.21.0
 
 # ── Environment variables ──────────────────────────────────────
 ENV DISPLAY=:99
